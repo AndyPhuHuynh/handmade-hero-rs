@@ -1,120 +1,26 @@
 #![windows_subsystem = "windows"]
 
-use std::ffi::c_void;
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
+mod win32;
+
+use std::marker::PhantomPinned;
+use std::pin::Pin;
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, GetDC, ReleaseDC, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS, HDC, PAINTSTRUCT, SRCCOPY,
-};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Memory::{
-    VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE,
-};
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, MessageBoxW, PeekMessageW,
-    RegisterClassW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, MB_ICONINFORMATION,
-    MB_OK, MSG, PM_REMOVE, WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_CLOSE, WM_DESTROY, WM_PAINT,
-    WM_QUIT, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
-};
+use windows::Win32::Foundation::{HWND, RECT, };
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, GetDC, ReleaseDC, StretchDIBits, DIB_RGB_COLORS, HDC, PAINTSTRUCT, SRCCOPY};
+use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetClientRect, MessageBoxW, PeekMessageW, TranslateMessage, MB_ICONINFORMATION, MB_OK, MSG, PM_REMOVE, WM_QUIT};
 
-// TODO: This is a global (EP2 15:40)
-static IS_RUNNING: AtomicBool = AtomicBool::new(false);
-static mut GLOBAL_BACK_BUFFER: Option<OffscreenBuffer> = None;
+use win32::buffer::OffscreenBuffer;
+use crate::win32::window::create_window;
 
-struct VirtualAllocMemory {
-    ptr: NonNull<c_void>,
-    size: usize,
-}
 
-impl VirtualAllocMemory {
-    fn new(buffer_size: usize) -> Option<Self> {
-        unsafe {
-            let ptr = VirtualAlloc(None, buffer_size, MEM_COMMIT, PAGE_READWRITE);
-            let ptr = NonNull::new(ptr)?;
-            Some(Self {
-                ptr,
-                size: buffer_size,
-            })
-        }
-    }
+fn popup_error(text: &str) {
+    let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+    let ptr = PCWSTR(wide.as_ptr());
 
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr() as *mut u8, self.size) }
-    }
-}
-
-impl Drop for VirtualAllocMemory {
-    fn drop(&mut self) {
-        unsafe {
-            let result = VirtualFree(self.ptr.as_ptr(), 0, MEM_RELEASE);
-            if let Err(e) = result {
-                debug_assert!(false, "VirtualFree failed: {}", e);
-            }
-        }
-    }
-}
-
-struct OffscreenBuffer {
-    info: BITMAPINFO,
-    memory: VirtualAllocMemory,
-}
-
-impl OffscreenBuffer {
-    pub const BYTES_PER_PIXEL: i32 = 4;
-
-    pub fn width(&self) -> i32 {
-        self.info.bmiHeader.biWidth
-    }
-
-    pub fn height(&self) -> i32 {
-        self.info.bmiHeader.biHeight.abs()
-    }
-
-    pub fn pitch(&self) -> usize {
-        (self.width() * Self::BYTES_PER_PIXEL) as usize
-    }
-}
-
-impl OffscreenBuffer {
-    pub fn new(width: i32, height: i32) -> Result<Self, &'static str> {
-        if width <= 0 {
-            return Err("bitmap width must be positive");
-        }
-        if height <= 0 {
-            return Err("bitmap height must be positive");
-        }
-
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: width,
-                biHeight: -height,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let bitmap_mem_size = width * height * Self::BYTES_PER_PIXEL;
-        let memory = match VirtualAllocMemory::new(bitmap_mem_size as usize) {
-            None => return Err("Unable to allocate memory with VirtualAlloc"),
-            Some(mem) => mem,
-        };
-
-        Ok(Self { info, memory })
-    }
-}
-
-fn popup_error(text: PCWSTR) {
     unsafe {
         MessageBoxW(
             None,
-            text,
+            ptr,
             w!("Critical Error!"),
             MB_OK | MB_ICONINFORMATION,
         );
@@ -179,7 +85,7 @@ fn display_buffer_in_window(
             0,
             buffer.width(),
             buffer.height(),
-            Some(buffer.memory.ptr.as_ptr()),
+            Some(buffer.memory.data().as_ptr()),
             &buffer.info,
             DIB_RGB_COLORS,
             SRCCOPY,
@@ -187,100 +93,91 @@ fn display_buffer_in_window(
     }
 }
 
-extern "system" fn wnd_proc(
-    window: HWND,
-    message: u32,
-    w_param: WPARAM,
-    l_param: LPARAM,
-) -> LRESULT {
-    let mut result: LRESULT = LRESULT(0);
-    match message {
-        WM_CLOSE => {
-            // TODO: Handle with a message (EP2 15:40)
-            IS_RUNNING.store(false, Ordering::Relaxed);
-        }
-        WM_ACTIVATEAPP => {},
-        WM_DESTROY => {
-            // TODO: Handle this as error and recreate window (EP2 15:40)
-            IS_RUNNING.store(false, Ordering::Relaxed);
-        }
-        WM_PAINT => unsafe {
-            if let Some(buffer) = GLOBAL_BACK_BUFFER.as_ref() {
-                let mut paint = PAINTSTRUCT::default();
-                let device_context: HDC = BeginPaint(window, &mut paint);
-                let (width, height) = get_client_rect_dimensions(window);
-                display_buffer_in_window(&buffer, device_context, width, height);
-                let _ = EndPaint(window, &mut paint);
-            };
-        },
-        _ => result = unsafe { DefWindowProcW(window, message, w_param, l_param) },
+pub struct App {
+    pub window: HWND,
+    is_running: bool,
+    pub back_buffer: OffscreenBuffer,
+    _pin: PhantomPinned,
+}
+
+impl App {
+    pub fn get_running(&self) -> bool {
+        self.is_running
     }
-    result
+
+    pub fn stop(&mut self) {
+        self.is_running = false;
+    }
+
+    pub fn paint(&mut self) {
+        let mut paint = PAINTSTRUCT::default();
+        let device_context: HDC = unsafe { BeginPaint(self.window, &mut paint) };
+        let (width, height) = get_client_rect_dimensions(self.window);
+        display_buffer_in_window(&self.back_buffer, device_context, width, height);
+        let _ = unsafe { EndPaint(self.window, &mut paint) };
+    }
+}
+
+impl App {
+    pub fn new() -> Pin<Box<Self>> {
+        let (width, height) = (1280, 720);
+        let buffer = OffscreenBuffer::new(width, height).expect("Unable to allocate buffer");
+
+        let mut app = Box::pin(Self {
+            window: HWND::default(),
+            is_running: true,
+            back_buffer: buffer,
+            _pin: PhantomPinned,
+        });
+
+        let window = match create_window(width, height, app.as_ref()) {
+            Ok(window) => window,
+            Err(error) => {
+                popup_error(error);
+                panic!("Error creating window")
+            }
+        };
+        unsafe {
+            app.as_mut().get_unchecked_mut().window = window;
+        }
+
+        app
+    }
+
+    pub fn run(&mut self) {
+        self.is_running = true;
+        while self.is_running {
+            unsafe {
+                let mut x_offset = 0;
+                let mut y_offset = 0;
+                while self.is_running {
+                    let mut msg = MSG::default();
+                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).0 > 0 {
+                        if msg.message == WM_QUIT {
+                            self.stop();
+                        }
+                        let _ = TranslateMessage(&mut msg);
+                        DispatchMessageW(&mut msg);
+                    }
+
+                    render_weird_gradient(&mut self.back_buffer, x_offset, y_offset);
+                    x_offset += 1;
+                    y_offset += 1;
+
+                    let device_context: HDC = GetDC(Some(self.window));
+                    let (width, height) = get_client_rect_dimensions(self.window);
+
+                    display_buffer_in_window(&mut self.back_buffer, device_context, width, height);
+                    ReleaseDC(Some(self.window), device_context);
+                }
+            }
+        }
+    }
 }
 
 fn main() {
+    let mut app = App::new();
     unsafe {
-        let h_instance: HINSTANCE = GetModuleHandleW(PCWSTR::null())
-            .expect("Unable to get hInstance")
-            .into();
-        let class_name = w!("HandmadeHeroWindowClass");
-
-        let wnd_class = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
-            lpfnWndProc: Some(wnd_proc),
-            hInstance: h_instance,
-            lpszClassName: class_name,
-            ..Default::default()
-        };
-
-        if RegisterClassW(&wnd_class) == 0 {
-            popup_error(w!("Failed to register window class"));
-            return;
-        }
-
-        let window: HWND = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            class_name,
-            w!("Handmade Hero"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            None,
-            None,
-            Some(h_instance),
-            None,
-        )
-        .expect("Error creating window");
-
-        let (width, height) = get_client_rect_dimensions(window);
-        GLOBAL_BACK_BUFFER = Some(OffscreenBuffer::new(width, height).expect("Unable to allocate buffer"));
-
-        IS_RUNNING.store(true, Ordering::Relaxed);
-        let mut x_offset = 0;
-        let mut y_offset = 0;
-        while IS_RUNNING.load(Ordering::Relaxed) {
-            let mut msg = MSG::default();
-            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).0 > 0 {
-                if msg.message == WM_QUIT {
-                    IS_RUNNING.store(false, Ordering::Relaxed);
-                }
-                let _ = TranslateMessage(&mut msg);
-                DispatchMessageW(&mut msg);
-            }
-
-            if let Some(buffer) = GLOBAL_BACK_BUFFER.as_mut() {
-                render_weird_gradient(buffer, x_offset, y_offset);
-                x_offset += 1;
-                y_offset += 1;
-
-                let device_context: HDC = GetDC(Some(window));
-                let (width, height) = get_client_rect_dimensions(window);
-
-                display_buffer_in_window(buffer, device_context, width, height);
-                ReleaseDC(Some(window), device_context);
-            }
-        }
+        app.as_mut().get_unchecked_mut().run();
     }
 }
