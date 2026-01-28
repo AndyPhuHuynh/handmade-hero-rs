@@ -1,5 +1,5 @@
-use windows::Win32::Graphics::Gdi::{BITMAPINFO, BITMAPINFOHEADER, BI_RGB};
 use crate::win32::memory::VirtualAllocMemory;
+use windows::Win32::Graphics::Gdi::{BITMAPINFO, BITMAPINFOHEADER, BI_RGB};
 
 pub struct OffscreenBuffer {
     pub info: BITMAPINFO,

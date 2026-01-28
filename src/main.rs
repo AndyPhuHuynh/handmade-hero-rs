@@ -2,28 +2,28 @@
 
 mod win32;
 
-use std::marker::PhantomPinned;
-use std::pin::Pin;
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HWND, RECT, };
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, GetDC, ReleaseDC, StretchDIBits, DIB_RGB_COLORS, HDC, PAINTSTRUCT, SRCCOPY};
-use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetClientRect, MessageBoxW, PeekMessageW, TranslateMessage, MB_ICONINFORMATION, MB_OK, MSG, PM_REMOVE, WM_QUIT};
+use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, EndPaint, GetDC, ReleaseDC, StretchDIBits, DIB_RGB_COLORS, HDC, PAINTSTRUCT,
+    SRCCOPY,
+};
+use windows::Win32::UI::Input::XboxController::{XINPUT_STATE, XUSER_MAX_COUNT};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, GetClientRect, MessageBoxW, PeekMessageW, TranslateMessage,
+    MB_ICONINFORMATION, MB_OK, MSG, PM_REMOVE, WM_QUIT,
+};
 
 use win32::buffer::OffscreenBuffer;
-use crate::win32::window::create_window;
-
+use win32::window::create_window;
+use crate::win32::input::{load_xinput, load_xinput_get_state, load_xinput_set_state, xinput_get_state};
 
 fn popup_error(text: &str) {
     let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
     let ptr = PCWSTR(wide.as_ptr());
 
     unsafe {
-        MessageBoxW(
-            None,
-            ptr,
-            w!("Critical Error!"),
-            MB_OK | MB_ICONINFORMATION,
-        );
+        MessageBoxW(None, ptr, w!("Critical Error!"), MB_OK | MB_ICONINFORMATION);
     }
 }
 
@@ -97,7 +97,6 @@ pub struct App {
     pub window: HWND,
     is_running: bool,
     pub back_buffer: OffscreenBuffer,
-    _pin: PhantomPinned,
 }
 
 impl App {
@@ -119,15 +118,14 @@ impl App {
 }
 
 impl App {
-    pub fn new() -> Pin<Box<Self>> {
+    pub fn new() -> Box<Self> {
         let (width, height) = (1280, 720);
         let buffer = OffscreenBuffer::new(width, height).expect("Unable to allocate buffer");
 
-        let mut app = Box::pin(Self {
+        let mut app = Box::new(Self {
             window: HWND::default(),
             is_running: true,
             back_buffer: buffer,
-            _pin: PhantomPinned,
         });
 
         let window = match create_window(width, height, app.as_ref()) {
@@ -137,47 +135,41 @@ impl App {
                 panic!("Error creating window")
             }
         };
-        unsafe {
-            app.as_mut().get_unchecked_mut().window = window;
-        }
+        app.window = window;
 
         app
     }
 
     pub fn run(&mut self) {
         self.is_running = true;
-        while self.is_running {
-            unsafe {
-                let mut x_offset = 0;
-                let mut y_offset = 0;
-                while self.is_running {
-                    let mut msg = MSG::default();
-                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).0 > 0 {
-                        if msg.message == WM_QUIT {
-                            self.stop();
-                        }
-                        let _ = TranslateMessage(&mut msg);
-                        DispatchMessageW(&mut msg);
+        unsafe {
+            let mut x_offset = 0;
+            let mut y_offset = 0;
+            while self.is_running {
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).0 > 0 {
+                    if msg.message == WM_QUIT {
+                        self.stop();
                     }
-
-                    render_weird_gradient(&mut self.back_buffer, x_offset, y_offset);
-                    x_offset += 1;
-                    y_offset += 1;
-
-                    let device_context: HDC = GetDC(Some(self.window));
-                    let (width, height) = get_client_rect_dimensions(self.window);
-
-                    display_buffer_in_window(&mut self.back_buffer, device_context, width, height);
-                    ReleaseDC(Some(self.window), device_context);
+                    let _ = TranslateMessage(&mut msg);
+                    DispatchMessageW(&mut msg);
                 }
+                
+                render_weird_gradient(&mut self.back_buffer, x_offset, y_offset);
+                x_offset += 1;
+                y_offset += 1;
+
+                let device_context: HDC = GetDC(Some(self.window));
+                let (width, height) = get_client_rect_dimensions(self.window);
+
+                display_buffer_in_window(&mut self.back_buffer, device_context, width, height);
+                ReleaseDC(Some(self.window), device_context);
             }
         }
     }
 }
 
 fn main() {
-    let mut app = App::new();
-    unsafe {
-        app.as_mut().get_unchecked_mut().run();
-    }
+    load_xinput().expect("Failed to load XInput");
+    App::new().run();
 }
